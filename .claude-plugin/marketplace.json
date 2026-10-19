@@ -1,0 +1,14 @@
+{
+  "name": "video-context",
+  "owner": {
+    "name": "Luis Hernandez"
+  },
+  "plugins": [
+    {
+      "name": "video-context",
+      "source": "./",
+      "description": "Turns local video or audio into context for the agent (transcript with exact minutes + frames at any second) so it can build summaries, requirements, diagrams, canvases or data models. No API, nothing uploaded, no cost.",
+      "version": "0.1.0"
+    }
+  ]
+}

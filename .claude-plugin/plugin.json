@@ -1,0 +1,19 @@
+{
+  "name": "video-context",
+  "version": "0.1.0",
+  "description": "Turns local video or audio into context an agent can use: a transcript with exact minutes and the frame at a given second, including whatever is on screen. Good for summaries, requirements and decisions, and for building diagrams, canvases or data models. No API, no cost.",
+  "author": {
+    "name": "Luis Hernandez"
+  },
+  "license": "MIT",
+  "keywords": [
+    "video",
+    "audio",
+    "transcription",
+    "whisper",
+    "ffmpeg",
+    "subtitles",
+    "frames",
+    "summary"
+  ]
+}

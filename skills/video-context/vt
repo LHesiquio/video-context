@@ -1,0 +1,229 @@
+#!/usr/bin/env -S uv run --script --frozen
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["faster-whisper==1.2.1", "av==15.1.0"]
+# ///
+"""vt — video → audio → text with timestamps → exact frames.
+
+Commands:
+  vt probe VIDEO
+  vt transcribe VIDEO [--model small] [--language en] [--out DIR]
+  vt frames VIDEO [--every 15] [--out DIR]
+  vt frame VIDEO --at 12:34.5 [--out DIR]
+
+Dependencies are pinned exactly and run with --frozen against vt.lock.
+Regenerate the lock with `uv lock --script vt` after editing them.
+"""
+import argparse
+import datetime
+import json
+import math
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+
+MAX_TILES = 24  # cap on contact-sheet tiles: 4x6 at 320px ≈ 1.5k tokens
+
+
+def die(msg):
+    sys.exit(f"vt: {msg}")
+
+
+def run(cmd):
+    p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+    if p.returncode != 0:
+        die(f"failed: {' '.join(str(c) for c in cmd)}\n{p.stderr[-600:]}")
+    return p.stdout
+
+
+def parse_ts(s):
+    """Accepts 12:34.5, 1:02:03, 90 or 90.25 → seconds."""
+    try:
+        parts = [float(p) for p in str(s).strip().split(":")]
+    except ValueError:
+        die(f"invalid timestamp: {s}")
+    if not 1 <= len(parts) <= 3:
+        die(f"invalid timestamp: {s}")
+    sec = 0.0
+    for n in parts:
+        sec = sec * 60 + n
+    return sec
+
+
+def fmt_ts(sec):
+    sec = int(sec)
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:60] or "video"
+
+
+def out_dir(video, out):
+    if out:
+        return pathlib.Path(out).expanduser().resolve()
+    return pathlib.Path.cwd() / "output" / slugify(pathlib.Path(video).stem)
+
+
+def probe(path):
+    if not pathlib.Path(path).is_file():
+        die(f"not found: {path}")
+    info = json.loads(run(["ffprobe", "-v", "error", "-print_format", "json",
+                           "-show_format", "-show_streams", path]))
+    streams = info.get("streams", [])
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    duration = float(info.get("format", {}).get("duration") or 0)
+    fps = 0.0
+    if video_stream:
+        num, _, den = (video_stream.get("avg_frame_rate") or "0/1").partition("/")
+        if float(den or 1) != 0:
+            fps = round(float(num) / float(den), 3)
+    return {
+        "duration_s": round(duration, 3),
+        "fps": fps,
+        "video": video_stream.get("codec_name") if video_stream else None,
+        "audio": audio_stream.get("codec_name") if audio_stream else None,
+        "size_mb": round(int(info.get("format", {}).get("size") or 0) / 1e6, 2),
+    }
+
+
+def write_manifest(out, video, data):
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "manifest.json"
+    manifest = json.loads(path.read_text()) if path.exists() else {}
+    manifest.update({
+        "source": str(pathlib.Path(video).resolve()),
+        "slug": out.name,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "version": 1,
+    })
+    for key, value in data.items():
+        if isinstance(value, dict) and isinstance(manifest.get(key), dict):
+            manifest[key].update(value)
+        else:
+            manifest[key] = value
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    return path
+
+
+def extract_audio(video, wav):
+    run(["ffmpeg", "-y", "-v", "error", "-i", video, "-vn", "-ac", "1",
+         "-ar", "16000", "-c:a", "pcm_s16le", wav])
+
+
+def cmd_probe(args):
+    info = probe(args.video)
+    info["duration"] = fmt_ts(info["duration_s"])
+    print(json.dumps(info, indent=2, ensure_ascii=False))
+
+
+def cmd_transcribe(args):
+    info = probe(args.video)
+    if not info["audio"]:
+        die("file has no audio stream")
+    out = out_dir(args.video, args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    from faster_whisper import WhisperModel  # heavy import: only here
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = pathlib.Path(tmp) / "audio.wav"
+        extract_audio(args.video, wav)
+        model = WhisperModel(args.model, device="cpu", compute_type="int8")
+        segments, meta = model.transcribe(
+            str(wav), language=args.language, vad_filter=True, word_timestamps=True)
+        segments = list(segments)
+
+    rows = [{"start": round(s.start, 3), "end": round(s.end, 3), "text": s.text.strip(),
+             "words": [{"start": round(w.start, 3), "end": round(w.end, 3), "word": w.word}
+                       for w in (s.words or [])]} for s in segments]
+    (out / "segments.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n")
+
+    header = (f"# {pathlib.Path(args.video).name} — {fmt_ts(meta.duration)} · "
+              f"{meta.language} · {args.model}/int8\n")
+    body = "".join(f"\n## {fmt_ts(s['start'])} → {fmt_ts(s['end'])}\n{s['text']}\n" for s in rows)
+    (out / "transcript.md").write_text(header + body)
+
+    write_manifest(out, args.video, {
+        "duration_s": info["duration_s"],
+        "transcript": {"model": args.model, "compute": "cpu/int8", "language": meta.language,
+                       "language_probability": round(meta.language_probability, 3),
+                       "segments": len(rows), "file": "transcript.md",
+                       "segments_file": "segments.json"},
+    })
+    if not rows:
+        print("warning: 0 segments (speechless audio? music?) — check the language with --language")
+    print(f"out: {out}")
+    print(f"transcript: {out / 'transcript.md'}")
+    print(f"segments: {len(rows)} · detected language: {meta.language}")
+
+
+def cmd_frames(args):
+    info = probe(args.video)
+    if not info["video"]:
+        die("file has no video stream")
+    out = out_dir(args.video, args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    duration = info["duration_s"] or 0
+    interval = max(args.every, duration / MAX_TILES) if duration else args.every
+    count = max(1, math.ceil(duration / interval)) if duration else 1
+    rows = max(1, math.ceil(count / args.cols))
+    sheet = out / "sheet.jpg"
+    run(["ffmpeg", "-y", "-v", "error", "-i", args.video, "-vf",
+         f"fps=1/{interval:.3f},scale={args.width}:-2,tile={args.cols}x{rows}",
+         "-frames:v", "1", "-q:v", "4", sheet])
+    write_manifest(out, args.video, {
+        "duration_s": info["duration_s"],
+        "sheet": {"file": "sheet.jpg", "interval_s": round(interval, 3), "tiles": count,
+                  "cols": args.cols, "rows": rows, "tile_width": args.width,
+                  "first_frame_at_s": 0.0},
+        "frames_dir": "frames",
+    })
+    print(f"sheet: {sheet} ({count} frames, one every {interval:.1f}s, grid {args.cols}x{rows})")
+
+
+def cmd_frame(args):
+    at = parse_ts(args.at)
+    duration = probe(args.video)["duration_s"]
+    if at > duration:
+        die(f"{args.at} is past the end of the file ({fmt_ts(duration)})")
+    out = out_dir(args.video, args.out)
+    (out / "frames").mkdir(parents=True, exist_ok=True)
+    target = out / "frames" / f"{at:09.3f}s.jpg"
+    run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.3f}", "-i", args.video,
+         "-frames:v", "1", "-vf", "scale=512:-2", "-q:v", "4", target])
+    write_manifest(out, args.video, {})
+    print(f"frame: {target}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="vt", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, help_, fn):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("video")
+        s.add_argument("--out", help="output directory (default: ./output/<slug>)")
+        s.set_defaults(fn=fn)
+        return s
+
+    add("probe", "duration, fps, streams", cmd_probe)
+    t = add("transcribe", "audio → text with timestamps", cmd_transcribe)
+    t.add_argument("--model", default="small", help="tiny|base|small|medium (def: small)")
+    t.add_argument("--language", help="ISO code (en, es…); empty = autodetect")
+    f = add("frames", "contact sheet of the whole video", cmd_frames)
+    f.add_argument("--every", type=float, default=15, help="seconds between frames (default: 15)")
+    f.add_argument("--cols", type=int, default=4, help="grid columns (default: 4)")
+    f.add_argument("--width", type=int, default=320, help="width of each frame (default: 320)")
+    fr = add("frame", "one frame at an exact second", cmd_frame)
+    fr.add_argument("--at", required=True, help="HH:MM:SS[.mmm], MM:SS or seconds")
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
